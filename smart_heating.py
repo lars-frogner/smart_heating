@@ -24,9 +24,11 @@ def plot(*artists,
          ylim=None,
          xlabel=None,
          ylabel=None,
+         title=None,
          second_ylim=None,
          second_ylabel=None,
          legend_loc='best',
+         aspect=None,
          fig_kwargs={},
          data_save_path=None,
          output_path=None):
@@ -38,13 +40,18 @@ def plot(*artists,
                     ylim=ylim,
                     xlabel=xlabel,
                     ylabel=ylabel,
+                    title=title,
                     second_ylim=second_ylim,
                     second_ylabel=second_ylabel,
                     legend_loc=legend_loc,
+                    aspect=aspect,
                     fig_kwargs=fig_kwargs)
 
         with open(data_save_path, 'wb') as f:
             pickle.dump(data, f)
+
+    if output_path is None:
+        return
 
     fig, first_ax = plt.subplots(**fig_kwargs)
 
@@ -53,8 +60,12 @@ def plot(*artists,
         first_ax.xaxis.set_major_formatter(
             mdates.DateFormatter('%d.%m-%y %H:%M'))
 
+    if aspect is not None:
+        first_ax.set_aspect(aspect)
+
     first_ax.set_xlabel(xlabel)
     first_ax.set_ylabel(ylabel)
+    first_ax.set_title(title)
 
     if xlim is not None:
         first_ax.set_xlim(*xlim)
@@ -120,7 +131,13 @@ def plot(*artists,
                     legend_handles.append(Line2D([], [], **artist))
                     legend_labels.append(label)
             else:
+                colorbar = artist.pop('colorbar', False)
+                clabel = artist.pop('clabel', None)
+
                 sc = ax.scatter(x_values, y_values, **artist)
+
+                if colorbar:
+                    fig.colorbar(sc, label=clabel)
 
                 if label is not None and label not in legend_labels:
                     legend_handles.append(
@@ -135,10 +152,7 @@ def plot(*artists,
         first_ax.legend(legend_handles, legend_labels, loc=legend_loc)
 
     fig.tight_layout()
-    if output_path is None:
-        plt.show()
-    else:
-        fig.savefig(output_path)
+    fig.savefig(output_path)
 
 
 def datetime_to_timestamp(datetime):
@@ -210,10 +224,16 @@ class SmartHeating(hass.Hass):
         if self.debug:
             self.set_log_level('DEBUG')
 
-        # if self.args['run']:
-        #     self.run_in(self.run, 0)
+        if self.run:
+            self.run_in(self.start_running, 0)
 
-        self.create_plots()
+        if self.plot_interval is not None:
+            if self.has_model() or self.setup_time is not None or not self.run:
+                self.create_plot_data()
+
+            self.run_every(self.create_plot_data,
+                           f'now+{int(self.plot_interval)}',
+                           self.plot_interval)
 
         self.log('SmartHeating initialized', level='DEBUG')
 
@@ -221,6 +241,7 @@ class SmartHeating(hass.Hass):
         self.root_path = Path(self.app_dir) / 'smart_heating' / self.name
         self.data_path = self.root_path / 'data'
         self.figure_path = self.root_path / 'figures'
+        self.figure_data_path = self.root_path / 'figure_data'
 
         self.setup_time_path = self.data_path / 'setup_time.dat'
 
@@ -230,9 +251,11 @@ class SmartHeating(hass.Hass):
 
         os.makedirs(self.data_path, exist_ok=True)
         os.makedirs(self.figure_path, exist_ok=True)
+        os.makedirs(self.figure_data_path, exist_ok=True)
 
     def _handle_input_args(self):
         self.debug = self.args.get('debug', False)
+        self.run = self.args.get('run', True)
 
         self.mode = self.args.get('mode', 'optimal')
         if self.mode not in self.valid_modes:
@@ -255,9 +278,15 @@ class SmartHeating(hass.Hass):
 
         self.comfort_temperature = self.args['comfort_temperature']
         self.minimum_temperature = self.args['minimum_temperature']
+        self.maximum_temperature = self.args.get('maximum_temperature',
+                                                 self.comfort_temperature)
         if self.comfort_temperature < self.minimum_temperature:
             self._terminate_with_error(
                 f'Minimum temperature ({self.minimum_temperature}) can not exceed comfort temperature ({self.comfort_temperature})'
+            )
+        if self.comfort_temperature > self.maximum_temperature:
+            self._terminate_with_error(
+                f'Comfort temperature ({self.comfort_temperature}) can not exceed maximum temperature ({self.maximum_temperature})'
             )
 
         self.thermostat = self.get_entity(self.args['thermostat_id'])
@@ -276,17 +305,20 @@ class SmartHeating(hass.Hass):
             ) if 'power_consumption_meter_id' in self.args else None
             self.heating_power = self.args.get('heating_power', None)
 
-            self.tibber_access_token = self.args[
-                'tibber_access_token'] if self.mode == 'optimal' else None
+            self.power_price_sensor = self.get_entity(
+                self.args.get('power_price_id',
+                              None)) if 'power_price_id' in self.args else None
 
-    def run(self, *args):
-        if self.plot_interval is not None:
-            self.run_every(self.create_plots, 'now', self.plot_interval)
+            self.tibber_access_token = self.args.get('tibber_access_token',
+                                                     None)
+
+    def start_running(self, *args):
 
         if self.mode == 'classic':
             self.begin_operation()
         else:
-            self.run_daily(self.update_models, self.comfort_start_time)
+            self.run_daily(self.update_models_callback,
+                           self.comfort_start_time)
 
             if not self.has_model() and self.setup_time is None:
                 self.gather_data_for_initial_model()
@@ -302,9 +334,10 @@ class SmartHeating(hass.Hass):
 
         self.run_in(self._wait_for_stable_temperature,
                     dt.timedelta(hours=1.0).total_seconds(),
-                    is_before_heating=True,
+                    heating_done=False,
                     max_temperature_rate=1.0,
-                    min_temperature=0.9 * self.comfort_temperature)
+                    min_temperature=0.95 * self.maximum_temperature,
+                    min_remaining_heating_hours=2.0)
 
     def _wait_for_stable_temperature(self, kwargs):
         current_time = self._local_now()
@@ -319,15 +352,19 @@ class SmartHeating(hass.Hass):
 
         processed_record = recorder.create_processed_record()
 
-        if np.abs(processed_record.temperature_rates[-1] * dt.timedelta(
-                hours=1).total_seconds()) <= kwargs['max_temperature_rate']:
+        if np.abs(
+                processed_record.temperature_rates[-1] *
+                dt.timedelta(hours=1).total_seconds()
+        ) <= kwargs['max_temperature_rate'] and processed_record.temperatures[
+                -1] <= kwargs['min_temperature']:
             self.log('Temperature is stable', level='DEBUG')
-            if kwargs.get('is_before_heating', False):
-                self.set_thermostat_temperature(self.comfort_temperature)
+            if kwargs.get('heating_done', True):
+                self._complete_data_gathering()
+            else:
+                self.set_thermostat_temperature(self.maximum_temperature)
+                kwargs['heating_start_time'] = self._local_now()
                 self.run_in(self._wait_for_high_enough_temperature,
                             dt.timedelta(hours=0.5).total_seconds(), **kwargs)
-            else:
-                self._complete_data_gathering()
         else:
             self.log('Temperature is not stable', level='DEBUG')
             self.run_in(self._wait_for_stable_temperature,
@@ -340,26 +377,37 @@ class SmartHeating(hass.Hass):
                         dt.timedelta(hours=0.5).total_seconds(), **kwargs)
         else:
             self.log('Temperature is high enough', level='DEBUG')
-            kwargs['is_before_heating'] = False
+            heating_duration = self._local_now() - kwargs['heating_start_time']
+            kwargs[
+                'min_remaining_heating_hours'] -= heating_duration.total_seconds(
+                ) / dt.timedelta(hours=1).total_seconds()
+            if kwargs['min_remaining_heating_hours'] > 0.0:
+                self.log('Total heating duration not long enough yet',
+                         level='DEBUG')
+            else:
+                kwargs['heating_done'] = True
             self.set_thermostat_temperature(self.minimum_temperature)
             self._wait_for_stable_temperature(kwargs)
 
     def _complete_data_gathering(self):
         self._write_setup_time(self.setup_time)
-        self.update_models_and_begin_operation()
+        self.update_models_and_begin_operation(exclude_comfort_period=False)
 
-    def update_models_and_begin_operation(self):
-        self.update_models()
+    def update_models_and_begin_operation(self, **kwargs):
+        self.update_models(**kwargs)
         self.begin_operation()
 
-    def update_models(self, *args):
+    def update_models_callback(self, kwargs):
+        self.update_models(**kwargs)
+
+    def update_models(self, **kwargs):
         self.log('Updating models with data from previous day', level='DEBUG')
-        self.update_model_with_historical_data()
+        self.update_model_with_historical_data(**kwargs)
         self.update_forecast_correction_with_historical_data()
 
     def begin_operation(self):
         self.log('Beginning operation', level='DEBUG')
-        if self.time_is_in_comfort_period():
+        if self._time_is_in_comfort_period():
             self._begin_comfort_period()
         else:
             self._perform_monitoring()
@@ -492,11 +540,23 @@ class SmartHeating(hass.Hass):
         times = np.linspace(start_time, end_time, n_times)
         return times
 
-    def _obtain_projected_outside_temperatures(self, times, current_datetime):
-        forecasted_temperatures = self._evaluate_temperature_forecast(times)
+    def _obtain_projected_outside_temperatures(self,
+                                               times,
+                                               current_datetime,
+                                               trim_times=False):
+        forecasted_temperatures = self._evaluate_temperature_forecast(
+            times, force_evaluation=trim_times)
+        if trim_times:
+            valid = times <= datetime_to_timestamp(
+                self.temperature_forecast_end_time)
+            times = times[valid]
+            forecasted_temperatures = forecasted_temperatures[valid]
         outside_temperatures = self._adjust_forecasted_temperatures_to_fit_measurement(
             times, forecasted_temperatures, measured_time=current_datetime)
-        return outside_temperatures
+        if trim_times:
+            return times, outside_temperatures
+        else:
+            return outside_temperatures
 
     def _fetch_power_price(self):
         if self.power_price is None:
@@ -567,7 +627,7 @@ class SmartHeating(hass.Hass):
         self.scheduled_heating_period = None
         self.next_monitoring_time = current_time + time_until_monitoring
 
-    def time_is_in_comfort_period(self, time=None):
+    def _time_is_in_comfort_period(self, time=None):
         if time is None:
             time = self.time()
         if self.comfort_end_time >= self.comfort_start_time:
@@ -575,10 +635,34 @@ class SmartHeating(hass.Hass):
         else:
             return time >= self.comfort_start_time or time < self.comfort_end_time
 
+    def _datetimes_are_in_comfort_period(self, datetimes):
+        return np.asarray([
+            self._time_is_in_comfort_period(datetime.time())
+            for datetime in datetimes
+        ],
+                          dtype=bool)
+
+    def _find_comfort_period_transition_indices(self, datetimes):
+        in_comfort_period = self._datetimes_are_in_comfort_period(datetimes)
+
+        comfort_period_start_indices = list(
+            np.nonzero(in_comfort_period[1:] > in_comfort_period[:-1])[0] + 1)
+        if in_comfort_period[0]:
+            comfort_period_start_indices.insert(0, 0)
+
+        comfort_period_end_indices = list(
+            np.nonzero(in_comfort_period[1:] < in_comfort_period[:-1])[0])
+        if in_comfort_period[-1]:
+            comfort_period_end_indices.append(-1)
+
+        return np.array(comfort_period_start_indices,
+                        dtype=int), np.array(comfort_period_end_indices,
+                                             dtype=int)
+
     def get_time_until_comfort_period(self, current_datetime=None):
         if current_datetime is None:
             current_datetime = self._local_now()
-        return 0 if self.time_is_in_comfort_period(
+        return 0 if self._time_is_in_comfort_period(
             time=current_datetime.time()) else remaining_seconds_to_time(
                 current_datetime, self.comfort_start_time)
 
@@ -587,7 +671,7 @@ class SmartHeating(hass.Hass):
             current_datetime = self._local_now()
         return remaining_seconds_to_time(
             current_datetime,
-            self.comfort_end_time) if self.time_is_in_comfort_period(
+            self.comfort_end_time) if self._time_is_in_comfort_period(
                 time=current_datetime.time()) else 0
 
     def get_current_temperature(self):
@@ -637,7 +721,8 @@ class SmartHeating(hass.Hass):
                                           hours_back=24,
                                           min_required_hours=2.0,
                                           time_interval=600.0,
-                                          update_heating_delay=True):
+                                          update_heating_delay=True,
+                                          exclude_comfort_period=True):
         self.log('Updating model with historical data', level='DEBUG')
 
         end_time = self._local_now() if end_time is None else end_time
@@ -651,7 +736,8 @@ class SmartHeating(hass.Hass):
             start_time,
             end_time,
             min_required_hours=min_required_hours,
-            time_interval=time_interval)
+            time_interval=time_interval,
+            exclude_comfort_period=exclude_comfort_period)
 
         if recorder is None:
             self.log('Duration too short, aborting', level='WARNING')
@@ -729,47 +815,57 @@ class SmartHeating(hass.Hass):
             save_path=self.forecast_correction_path,
             **kwargs).save()
 
-    def create_plots(self, *args):
+    def create_plot_data(self, *args):
+        if self.debug:
+            self.set_log_level('INFO')
+
+        self._update_temperature_forecast()
 
         current_time = self._local_now()
         self.plot_evolution(
-            current_time,  # - dt.timedelta(hours=48),
-            current_time,
+            current_time - dt.timedelta(hours=48),
             current_time + dt.timedelta(hours=22),
+            current_time,
             temperatures=['inside', 'outside', 'forecast'],
             indicators=[
                 'current_time', 'comfort_period', 'heating',
-                'comfort_temperature', 'minimum_temperature'
+                'comfort_temperature', 'minimum_temperature', 'monitoring_time'
             ],
             second_quantity='power_price',
-            output_path=(self.figure_path / 'test.png'))
+            title='Evolution',
+            data_save_path=(self.figure_data_path / 'evolution.pickle'))
 
-        # self.plot_historical_data('evolution', hours_back=24)
-        # self.plot_historical_data('evolution', hours_back=3 * 24)
+        self.plot_measurement_scatter(
+            hours_back=24,
+            title='Measurements (last day)',
+            data_save_path=(self.figure_data_path /
+                            'measurements_1_day.pickle'))
+        self.plot_measurement_scatter(
+            hours_back=72,
+            title='Measurements (last 3 days)',
+            data_save_path=(self.figure_data_path /
+                            'measurements_3_days.pickle'))
 
-        # self.plot_historical_data('scatter', hours_back=24)
-        # self.plot_historical_data('scatter', hours_back=3 * 24)
-
-        # self.plot_model_fit()
-
-        # self._update_temperature_forecast()
-
-        # self.plot_temperature_forecast(hours_ahead=22)
+        self.plot_model_fit(title='Fitted model',
+                            data_save_path=(self.figure_data_path /
+                                            'model_fit.pickle'))
 
         # self.plot_forecast_observation_correlation(
         #     hours_back=7 * 24,
-        #     output_path=(self.figure_path / 'forecast_correlation.png'))
+        #     data_save_path=(self.figure_data_path /
+        #                     'forecast_correlation.png'))
 
         # self.compare_modeled_to_actual_temperature_evolution(
         #     self._local_now() - dt.timedelta(hours=22), hours_duration=22.0)
 
-    def plot_historical_data(self,
-                             plot_type,
-                             end_time=None,
-                             hours_back=24.0,
-                             data_save_path=None,
-                             **kwargs):
-        self.log('Plotting historical data', level='DEBUG')
+        if self.debug:
+            self.set_log_level('DEBUG')
+
+    def plot_measurement_scatter(self,
+                                 end_time=None,
+                                 hours_back=24.0,
+                                 **kwargs):
+        self.log('Plotting measurement scatter', level='DEBUG')
 
         end_time = self._local_now() if end_time is None else end_time
         start_time = end_time - dt.timedelta(hours=hours_back)
@@ -779,7 +875,7 @@ class SmartHeating(hass.Hass):
             start_time = self.setup_time
 
         recorder = self._create_recorder_with_historical_data(
-            start_time, end_time, **kwargs)
+            start_time, end_time, exclude_comfort_period=True)
 
         if recorder is None:
             self.log('Duration too short, aborting', level='WARNING')
@@ -787,68 +883,7 @@ class SmartHeating(hass.Hass):
 
         processed_record = recorder.create_processed_record()
 
-        if plot_type == 'evolution':
-            self.log('Plotting temperature evolution', level='DEBUG')
-
-            output_path = self.figure_path / f'temperature_evolution_{hours_back:g}.png'
-
-            times = timestamps_to_datetimes(processed_record.times)
-            in_comfort_period = np.asarray([
-                self.time_is_in_comfort_period(time.time()) for time in times
-            ],
-                                           dtype=int)
-
-            extra_artists = []
-
-            extra_artists.append(
-                dict(type='fill',
-                     times=times,
-                     values=in_comfort_period,
-                     threshold=0.5,
-                     color='tab:green',
-                     alpha=0.2))
-
-            extra_artists.extend([
-                dict(type='hline',
-                     value=self.comfort_temperature,
-                     ls='--',
-                     color='crimson'),
-                dict(type='hline',
-                     value=self.minimum_temperature,
-                     ls='--',
-                     color='navy')
-            ])
-
-            forecasted_temperature_func = self._create_current_forecasted_temperature_representation(
-                start_time=processed_record.earliest_time,
-                end_time=processed_record.latest_time)
-
-            if forecasted_temperature_func is not None:
-                correction = self._obtain_forecast_correction()
-                corrected_forecasted_temperature_func = correction.corrected(
-                    forecasted_temperature_func)
-
-                extra_artists.extend([
-                    dict(times=times,
-                         values=forecasted_temperature_func(
-                             processed_record.times),
-                         label='Forecasted'),
-                    dict(times=times,
-                         values=corrected_forecasted_temperature_func(
-                             processed_record.times),
-                         label='Forecasted (corrected)')
-                ])
-
-            processed_record.plot_evolution(*extra_artists,
-                                            output_path=output_path)
-
-        elif plot_type == 'scatter':
-            self.log('Plotting measurement scatter', level='DEBUG')
-            processed_record.plot_scatter(
-                output_path=(self.figure_path /
-                             f'measurement_scatter_{hours_back:g}.png'))
-        else:
-            raise ValueError(f'Invalid plot type {plot_type}')
+        processed_record.plot_scatter(**kwargs)
 
     def plot_evolution(self,
                        start_time,
@@ -861,6 +896,9 @@ class SmartHeating(hass.Hass):
 
         artists = []
         second_ylabel = None
+
+        past_datetimes = []
+        future_datetimes = []
 
         if start_time < current_time:
 
@@ -877,56 +915,28 @@ class SmartHeating(hass.Hass):
                          level='WARNING')
             else:
                 processed_record = recorder.create_processed_record()
-                datetimes = timestamps_to_datetimes(processed_record.times)
-
-                if 'comfort_period' in indicators:
-                    in_comfort_period = np.asarray([
-                        self.time_is_in_comfort_period(datetime.time())
-                        for datetime in datetimes
-                    ],
-                                                   dtype=int)
-
-                    artists.append(
-                        dict(type='fill',
-                             x_values=datetimes,
-                             y_values=in_comfort_period,
-                             y_threshold=0.5,
-                             color='tab:green',
-                             alpha=0.2))
-
-                if 'comfort_temperature' in indicators:
-                    artists.append(
-                        dict(type='hline',
-                             y_value=self.comfort_temperature,
-                             ls='--',
-                             color='crimson'))
-
-                if 'minimum_temperature' in indicators:
-                    artists.append(
-                        dict(type='hline',
-                             y_value=self.minimum_temperature,
-                             ls='--',
-                             color='navy'))
+                past_datetimes = self.timestamps_to_local_datetimes(
+                    processed_record.times)
 
                 if 'heating' in indicators:
                     artists.append(
                         dict(type='fill',
-                             x_values=datetimes,
+                             x_values=past_datetimes,
                              y_values=processed_record.heating_powers,
                              y_threshold=50.0,
                              color='tab:red',
-                             alpha=0.2))
+                             alpha=0.5))
 
                 if 'inside' in temperatures:
                     artists.append(
-                        dict(x_values=datetimes,
+                        dict(x_values=past_datetimes,
                              y_values=processed_record.temperatures,
                              color='tab:green',
                              label='Temp. inside'))
 
                 if 'outside' in temperatures:
                     artists.append(
-                        dict(x_values=datetimes,
+                        dict(x_values=past_datetimes,
                              y_values=processed_record.outside_temperatures,
                              color='tab:blue',
                              label='Temp. outside'))
@@ -946,16 +956,16 @@ class SmartHeating(hass.Hass):
 
                         artists.append(
                             dict(
-                                x_values=datetimes,
+                                x_values=past_datetimes,
                                 y_values=corrected_forecasted_temperature_func(
                                     processed_record.times),
-                                color='tab:orange',
+                                color='tab:cyan',
                                 label='Temp. forecast'))
 
                 if second_quantity == 'heating_power':
                     artists.append(
                         dict(ax=1,
-                             x_values=datetimes,
+                             x_values=past_datetimes,
                              y_values=processed_record.heating_powers,
                              color='tab:red',
                              label='Heating'))
@@ -963,50 +973,111 @@ class SmartHeating(hass.Hass):
                 elif second_quantity == 'temperature_rate':
                     artists.append(
                         dict(ax=1,
-                             x_values=datetimes,
+                             x_values=past_datetimes,
                              y_values=processed_record.temperature_rates *
                              dt.timedelta(hours=1).total_seconds(),
-                             color='tab:red',
+                             color='tab:purple',
                              label='Temp. change'))
-                    second_ylabel = 'Rate of change [K/hour]'
+                    second_ylabel = 'Rate of change [°C/hour]'
                 elif second_quantity == 'power_price':
-                    power_price = self._fetch_power_price()
-                    if power_price.available:
-                        earliest_time = datetime_to_timestamp(
-                            power_price.earliest_time)
-                        valid_times = processed_record.times[
-                            processed_record.times >= earliest_time]
+                    power_price = self._create_power_price_representation(
+                        start_time=start_time, end_time=current_time)
+                    if power_price is None:
+                        power_price = self._fetch_power_price()
+                        if power_price.available:
+                            earliest_time = datetime_to_timestamp(
+                                power_price.earliest_time)
+                            valid_times = processed_record.times[
+                                processed_record.times >= earliest_time]
+                            artists.append(
+                                dict(
+                                    ax=1,
+                                    x_values=self.
+                                    timestamps_to_local_datetimes(valid_times),
+                                    y_values=power_price(valid_times),
+                                    color='tab:purple',
+                                    label='Power price'))
+                            second_ylabel = 'Price [NOK/kWh]'
+                        else:
+                            self.log('Power prices unavailable, skipping',
+                                     level='WARNING')
+                    else:
                         artists.append(
                             dict(ax=1,
-                                 x_values=timestamps_to_datetimes(valid_times),
-                                 y_values=power_price(valid_times),
-                                 color='tab:red',
+                                 x_values=past_datetimes,
+                                 y_values=power_price(processed_record.times),
+                                 color='tab:purple',
                                  label='Power price'))
-                        second_ylabel = f'Price [{power_price.unit}]'
-                    else:
-                        self.log('Power prices unavailable, skipping',
-                                 level='WARNING')
+                        second_ylabel = 'Price [NOK/kWh]'
 
         if 'current_time' in indicators:
             artists.append(
-                dict(type='vline', time=current_time, ls='-', color='k'))
+                dict(type='vline',
+                     x_value=current_time,
+                     ls='-',
+                     color='tab:gray'))
+
+        if 'comfort_temperature' in indicators:
+            artists.append(
+                dict(type='hline',
+                     y_value=self.comfort_temperature,
+                     ls='--',
+                     color='darkorange'))
+
+        if 'minimum_temperature' in indicators:
+            artists.append(
+                dict(type='hline',
+                     y_value=self.minimum_temperature,
+                     ls='--',
+                     color='mediumblue'))
 
         if end_time > current_time:
-            times = self._calculate_modeling_times(
+            future_times = self._calculate_modeling_times(
                 datetime_to_timestamp(current_time),
                 datetime_to_timestamp(end_time))
 
-            datetimes = timestamps_to_datetimes(times)
+            future_datetimes = self.timestamps_to_local_datetimes(future_times)
 
+        all_datetimes = past_datetimes + future_datetimes
+
+        if 'comfort_period' in indicators:
+            artists.append(
+                dict(type='fill',
+                     x_values=all_datetimes,
+                     y_values=self._datetimes_are_in_comfort_period(
+                         all_datetimes),
+                     y_threshold=0.5,
+                     color='darkgreen',
+                     alpha=0.2))
+
+        if end_time > current_time:
             outside_temperatures = self._obtain_projected_outside_temperatures(
-                times, current_time)
+                future_times, current_time)
 
-            if 'forcast' in temperatures:
+            if 'forecast' in temperatures:
                 artists.append(
-                    dict(x_values=datetimes,
+                    dict(x_values=future_datetimes,
                          y_values=outside_temperatures,
-                         color='tab:orange',
+                         color='tab:cyan',
                          label='Temp. forecast'))
+
+            if second_quantity == 'power_price':
+                power_price = self._fetch_power_price()
+                if power_price.available:
+                    latest_time = datetime_to_timestamp(
+                        power_price.latest_time)
+                    valid_times = future_times[future_times <= latest_time]
+                    artists.append(
+                        dict(ax=1,
+                             x_values=self.timestamps_to_local_datetimes(
+                                 valid_times),
+                             y_values=power_price(valid_times),
+                             color='tab:purple',
+                             label='Power price'))
+                    second_ylabel = 'Price [NOK/kWh]'
+                else:
+                    self.log('Power prices unavailable, skipping',
+                             level='WARNING')
 
             model = self._read_model()
 
@@ -1018,7 +1089,7 @@ class SmartHeating(hass.Hass):
 
                 if self.scheduled_heating_period is None:
                     max_heating_power, heating_start_time, heating_end_time = None, None, None
-                    planned_heating_powers = np.zeros_like(times)
+                    planned_heating_powers = np.zeros_like(future_times)
                 else:
                     max_heating_power = np.full(1, self.heating_power)
                     heating_start_time = np.full(
@@ -1026,21 +1097,34 @@ class SmartHeating(hass.Hass):
                     heating_end_time = np.full(
                         1, sum(self.scheduled_heating_period))
                     planned_heating_powers = self.heating_power * np.logical_and(
-                        times >= self.scheduled_heating_period[0],
-                        times < sum(self.scheduled_heating_period))
+                        future_times >= self.scheduled_heating_period[0],
+                        future_times < sum(self.scheduled_heating_period))
 
-                modeled_temperatures = model._compute_evolution_analytically(
-                    times,
-                    outside_temperatures,
-                    initial_temperature,
-                    heating_powers=max_heating_power,
-                    heating_start_times=heating_start_time,
-                    heating_end_times=heating_end_time)
+                if self.run:
+                    modeled_temperatures = model.compute_evolution_with_thermostat(
+                        future_times,
+                        outside_temperatures,
+                        initial_temperature,
+                        self.comfort_temperature,
+                        self.minimum_temperature,
+                        *self._find_comfort_period_transition_indices(
+                            future_datetimes),
+                        heating_powers=max_heating_power,
+                        heating_start_times=heating_start_time,
+                        heating_end_times=heating_end_time)
+                else:
+                    modeled_temperatures = model.compute_evolution(
+                        future_times,
+                        outside_temperatures,
+                        initial_temperature,
+                        heating_powers=max_heating_power,
+                        heating_start_times=heating_start_time,
+                        heating_end_times=heating_end_time)
 
                 if 'heating' in indicators and self.scheduled_heating_period is not None:
                     artists.append(
                         dict(type='fill',
-                             x_values=datetimes,
+                             x_values=future_datetimes,
                              y_values=planned_heating_powers,
                              y_threshold=50.0,
                              color='tab:red',
@@ -1049,14 +1133,14 @@ class SmartHeating(hass.Hass):
                 if 'monitoring_time' in indicators and self.next_monitoring_time is not None:
                     artists.append(
                         dict(type='vline',
-                             x_value=timestamp_to_datetime(
+                             x_value=self.timestamp_to_local_datetime(
                                  self.next_monitoring_time),
                              ls=':',
-                             color='tab:purple'))
+                             color='tab:olive'))
 
                 if 'inside' in temperatures:
                     artists.append(
-                        dict(x_values=datetimes,
+                        dict(x_values=future_datetimes,
                              y_values=modeled_temperatures,
                              color='tab:green',
                              label='Temp. inside'))
@@ -1064,38 +1148,22 @@ class SmartHeating(hass.Hass):
                 if second_quantity == 'heating_power':
                     artists.append(
                         dict(ax=1,
-                             x_values=datetimes,
+                             x_values=future_datetimes,
                              y_values=planned_heating_powers,
                              color='tab:red',
                              label='Heating'))
                     second_ylabel = 'Heating power [W]'
                 elif second_quantity == 'temperature_rate':
                     temperature_rates = np.gradient(modeled_temperatures,
-                                                    times)
+                                                    future_times)
                     artists.append(
                         dict(ax=1,
-                             x_values=datetimes,
+                             x_values=future_datetimes,
                              y_values=temperature_rates *
                              dt.timedelta(hours=1).total_seconds(),
-                             color='tab:red',
+                             color='tab:purple',
                              label='Temp. change'))
-                    second_ylabel = 'Rate of change [K/hour]'
-                elif second_quantity == 'power_price':
-                    power_price = self._fetch_power_price()
-                    if power_price.available:
-                        latest_time = datetime_to_timestamp(
-                            power_price.latest_time)
-                        valid_times = times[times <= latest_time]
-                        artists.append(
-                            dict(ax=1,
-                                 x_values=timestamps_to_datetimes(valid_times),
-                                 y_values=power_price(valid_times),
-                                 color='tab:red',
-                                 label='Power price'))
-                        second_ylabel = f'Price [{power_price.unit}]'
-                    else:
-                        self.log('Power prices unavailable, skipping',
-                                 level='WARNING')
+                    second_ylabel = 'Rate of change [°C/hour]'
 
         plot(*artists,
              x_uses_datetimes=True,
@@ -1106,8 +1174,11 @@ class SmartHeating(hass.Hass):
 
     def plot_model_fit(self, **kwargs):
         self.log('Plotting model fit', level='DEBUG')
-        table = self._obtain_measurement_table()
-        table.plot(output_path=(self.figure_path / 'model_fit.png'), **kwargs)
+        if self.table_path.exists():
+            table = self._obtain_measurement_table()
+            table.plot(**kwargs)
+        else:
+            self.log('No measurements found, aborting', level='WARNING')
 
     def plot_temperature_forecast(self, start_time=None, hours_ahead=24.0):
         self.log('Plotting temperature forecast', level='DEBUG')
@@ -1122,7 +1193,7 @@ class SmartHeating(hass.Hass):
         times = np.linspace(datetime_to_timestamp(start_time),
                             datetime_to_timestamp(end_time), 3600)
 
-        plot(dict(x_values=timestamps_to_datetimes(times),
+        plot(dict(x_values=self.timestamps_to_local_datetimes(times),
                   y_values=self._evaluate_temperature_forecast(times),
                   label='Forecast'),
              dict(x_values=[self._local_now()],
@@ -1138,7 +1209,7 @@ class SmartHeating(hass.Hass):
                                               end_time=None,
                                               hours_back=24.0,
                                               time_interval=600.0,
-                                              output_path=None):
+                                              **kwargs):
         self.log(
             'Plotting correlation between forecasted and observed temperatures',
             level='DEBUG')
@@ -1182,28 +1253,26 @@ class SmartHeating(hass.Hass):
 
         correction = self._obtain_forecast_correction()
 
-        fig, ax = plt.subplots()
-
-        ax.plot([-max_abs_temp, max_abs_temp], [-max_abs_temp, max_abs_temp],
-                'k--')
-        ax.plot([-max_abs_temp, max_abs_temp],
-                [correction(-max_abs_temp),
-                 correction(max_abs_temp)], 'g--')
-        ax.scatter(forecasted_temperature_func(times),
-                   measured_temperature_func(times))
-        ax.set_xlabel('Forecasted temperature [°C]')
-        ax.set_ylabel('Measured temperature [°C]')
-
-        ax.set_xlim(-max_abs_temp, max_abs_temp)
-        ax.set_ylim(-max_abs_temp, max_abs_temp)
-
-        ax.set_aspect('equal')
-
-        fig.tight_layout()
-        if output_path is None:
-            plt.show()
-        else:
-            fig.savefig(output_path)
+        plot(dict(x_values=[-max_abs_temp, max_abs_temp],
+                  y_values=[-max_abs_temp, max_abs_temp],
+                  color='tab:gray',
+                  ls='--'),
+             dict(x_values=[-max_abs_temp, max_abs_temp],
+                  y_values=[
+                      correction(-max_abs_temp),
+                      correction(max_abs_temp)
+                  ],
+                  color='tab:cyan',
+                  ls='--'),
+             dict(type='scatter',
+                  x_values=forecasted_temperature_func(times),
+                  y_values=measured_temperature_func(times),
+                  color='tab:orange',
+                  s=10),
+             xlabel='Forecasted temperature [°C]',
+             ylabel='Measured temperature [°C]',
+             aspect='equal',
+             **kwargs)
 
     def compare_modeled_to_actual_temperature_evolution(
             self,
@@ -1271,7 +1340,7 @@ class SmartHeating(hass.Hass):
             measured_time=start_time,
             measured_temperature=initial_outside_temperature)
 
-        modeled_temperatures = model._compute_evolution_analytically(
+        modeled_temperatures = model.compute_evolution(
             times,
             outside_temperatures,
             initial_temperature,
@@ -1279,7 +1348,7 @@ class SmartHeating(hass.Hass):
             heating_start_times=heating_start_times,
             heating_end_times=heating_end_times)
 
-        datetimes = timestamps_to_datetimes(times)
+        datetimes = self.timestamps_to_local_datetimes(times)
         plot(dict(x_values=datetimes,
                   y_values=modeled_temperatures,
                   label='Inside (modeled)'),
@@ -1315,11 +1384,22 @@ class SmartHeating(hass.Hass):
     def _local_now(self):
         return self._localize_datetime(self.datetime(), strip_tzinfo=False)
 
+    def timestamp_to_local_datetime(self, timestamp, strip_tzinfo=False):
+        return self._localize_datetime(timestamp_to_datetime(timestamp),
+                                       strip_tzinfo=strip_tzinfo)
+
+    def timestamps_to_local_datetimes(self, timestamps, **kwargs):
+        return [
+            self.timestamp_to_local_datetime(timestamp, **kwargs)
+            for timestamp in timestamps
+        ]
+
     def _create_recorder_with_historical_data(self,
                                               start_time,
                                               end_time,
                                               min_required_hours=2.0,
-                                              time_interval=600.0):
+                                              time_interval=300.0,
+                                              exclude_comfort_period=False):
         self.log('Creating recorder with historical data', level='DEBUG')
 
         if end_time < start_time + dt.timedelta(hours=min_required_hours):
@@ -1348,11 +1428,18 @@ class SmartHeating(hass.Hass):
 
         recorder = TemperatureRecorder()
 
-        datetimes = timestamps_to_datetimes(times)
+        datetimes = self.timestamps_to_local_datetimes(times)
 
-        heating_powers = power_consumption_func(times)  # [W]
-        temperatures = temperature_func(times)  # [K]
-        outside_temperatures = outside_temperature_func(times)  # [K]
+        if exclude_comfort_period:
+            datetimes = list(
+                filter(
+                    lambda datetime: not self._time_is_in_comfort_period(
+                        datetime.time()), datetimes))
+            times = datetimes_to_timestamps(datetimes)
+
+        heating_powers = power_consumption_func(times)
+        temperatures = temperature_func(times)
+        outside_temperatures = outside_temperature_func(times)
 
         recorder.add_measurements(datetimes, heating_powers, temperatures,
                                   outside_temperatures)
@@ -1363,17 +1450,19 @@ class SmartHeating(hass.Hass):
                                        times,
                                        forecast=None,
                                        forecast_end_time=None,
-                                       allow_thermometer_fallback=True):
+                                       allow_thermometer_fallback=True,
+                                       force_evaluation=False):
         if forecast is None or forecast_end_time is None:
             forecast = self.temperature_forecast
             forecast_end_time = self.temperature_forecast_end_time
 
-        if forecast is None or forecast_end_time is None or datetime_to_timestamp(
-                forecast_end_time) < times[-1]:
+        if forecast is None or forecast_end_time is None or (
+                not force_evaluation
+                and datetime_to_timestamp(forecast_end_time) < times[-1]):
             if allow_thermometer_fallback:
                 self.log('Using temperatures from previous day as forecast',
                          level='WARNING')
-                start_time = timestamp_to_datetime(times[0])
+                start_time = self.timestamp_to_local_datetime(times[0])
                 previous_day_start_time = start_time - dt.timedelta(days=1)
                 previous_day_times = times - dt.timedelta(
                     days=1).total_seconds()
@@ -1418,9 +1507,10 @@ class SmartHeating(hass.Hass):
     def _create_temperature_representation(self, **kwargs):
         self.log('Creating temperature representation', level='DEBUG')
         return self._create_sensor_state_representation(
-            'sensor.multisensor_1_temperature',  #str(self.thermostat),
-            **kwargs
-        )  #, extractor=lambda entry: float(entry['attributes']['current_temperature']))
+            str(self.thermostat),
+            extractor=lambda entry: float(entry['attributes'][
+                'current_temperature']),
+            **kwargs)
 
     def _create_outside_temperature_representation(
             self, allow_forecast_fallback=True, **kwargs):
@@ -1470,6 +1560,16 @@ class SmartHeating(hass.Hass):
                                           copy=False,
                                           fill_value='extrapolate',
                                           assume_sorted=True)
+
+    def _create_power_price_representation(self, **kwargs):
+        self.log('Creating power price representation', level='DEBUG')
+        if self.power_price_sensor is None:
+            return None
+        else:
+            return self._create_sensor_state_representation(
+                str(self.power_price_sensor),
+                smoothing_window_duration=None,
+                **kwargs)
 
     def _create_current_forecasted_temperature_representation(self, **kwargs):
         self.log('Creating forecasted temperature representation',
@@ -1560,10 +1660,6 @@ class SmartHeating(hass.Hass):
         start_time = (end_time - dt.timedelta(hours=hours_back)
                       ) if start_time is None else start_time
 
-        self.log(entity_id)
-        self.log(self._localize_datetime(start_time))
-        self.log(self._localize_datetime(end_time))
-
         history = self.get_history(
             entity_id=entity_id,
             start_time=self._localize_datetime(start_time),
@@ -1590,7 +1686,7 @@ class SmartHeating(hass.Hass):
             return None
 
     def _write_setup_time(self, setup_time):
-        with open(self.setup_time_path, 'r') as f:
+        with open(self.setup_time_path, 'w') as f:
             f.write(setup_time.isoformat())
 
     def _obtain_measurement_table(self):
@@ -1797,6 +1893,7 @@ class TibberPowerPrice(PowerPrice):
     def __init__(self, access_token: str) -> None:
         super().__init__()
         self.access_token = access_token
+        self._unit = 'NOK/kWh'
 
     def fetch(self) -> None:
         price_info = asyncio.run(self._fetch_price_info_or_none())
@@ -1837,9 +1934,6 @@ class TibberPowerPrice(PowerPrice):
 
         home = homes[0]
         await home.update_price_info()
-
-        currency = home.currency
-        self._unit = f'{"NOK" if currency == "" else currency}/{home.consumption_unit}'
 
         await connection.close_connection()
 
@@ -1945,8 +2039,9 @@ class TemperatureRecorder:
             delay_power_threshold=self.delay_power_threshold)
 
     def plot_evolution(self,
+                       convert_timestamps: Callable = timestamps_to_datetimes,
                        output_path: Optional[Union[str, Path]] = None) -> None:
-        times = timestamps_to_datetimes(self.data_arrays['times'])
+        times = convert_timestamps(self.data_arrays['times'])
         heating_powers = self.data_arrays['heating_powers']
         temperatures = self.data_arrays['temperatures']
         outside_temperatures = self.data_arrays['outside_temperatures']
@@ -2019,12 +2114,12 @@ class ProcessedTemperatureRecord:
         self.temperature_diffs = self.temperatures - self.outside_temperatures
 
     @property
-    def earliest_time(self) -> dt.datetime:
-        return timestamp_to_datetime(self.times[0])
+    def earliest_timestamp(self) -> float:
+        return self.times[0]
 
     @property
-    def latest_time(self) -> dt.datetime:
-        return timestamp_to_datetime(self.times[-1])
+    def latest_timestamp(self) -> float:
+        return self.times[-1]
 
     def detect_heating_delay(self, fallback_value: float = 0.0) -> float:
         heating_delay = self.__class__._estimate_heating_delay(
@@ -2062,9 +2157,10 @@ class ProcessedTemperatureRecord:
 
     def plot_evolution(self,
                        *args,
+                       convert_timestamps: Callable = timestamps_to_datetimes,
                        heating_power_threshold: float = 50.0,
                        **kwargs) -> None:
-        times = timestamps_to_datetimes(self.times)
+        times = convert_timestamps(self.times)
         marker = None
 
         plot(dict(x_values=times,
@@ -2081,34 +2177,28 @@ class ProcessedTemperatureRecord:
              dict(type='fill',
                   x_values=times,
                   y_values=self.corrected_heating_powers,
-                  threshold=heating_power_threshold,
+                  y_threshold=heating_power_threshold,
                   color='tab:red',
                   alpha=0.2),
              *args,
              x_uses_datetimes=True,
              xlim=(times[0], times[-1]),
              ylabel='Temperature [°C]',
-             second_ylabel='Rate of change [K/h]',
+             second_ylabel='Rate of change [°C/hour]',
              **kwargs)
 
-    def plot_scatter(self, output_path=None) -> None:
-        fig, ax = plt.subplots()
-
-        sc = ax.scatter(self.temperature_diffs,
-                        self.temperature_rates *
-                        dt.timedelta(hours=1).total_seconds(),
-                        c=self.corrected_heating_powers,
-                        s=10)
-
-        fig.colorbar(sc, label='Heating power [W]')
-        ax.set_xlabel('Temperature difference [K]')
-        ax.set_ylabel('Temperature rate of change [K/h]')
-
-        fig.tight_layout()
-        if output_path is None:
-            plt.show()
-        else:
-            fig.savefig(output_path)
+    def plot_scatter(self, **kwargs) -> None:
+        plot(dict(type='scatter',
+                  x_values=self.temperature_diffs,
+                  y_values=self.temperature_rates *
+                  dt.timedelta(hours=1).total_seconds(),
+                  c=self.corrected_heating_powers,
+                  s=10,
+                  colorbar=True,
+                  clabel='Heating power [W]'),
+             xlabel='Temperature difference [°C]',
+             ylabel='Temperature rate of change [°C/hour]',
+             **kwargs)
 
     @classmethod
     def compute_smooth_evolution(
@@ -2416,10 +2506,7 @@ class MeasurementTable:
         return NewtonHeatingModel(heating_delay, *self._fit_measurements(),
                                   **kwargs)
 
-    def plot(self,
-             include_fit: bool = True,
-             data_save_path: Optional[Union[str, Path]] = None,
-             output_path: Optional[Union[str, Path]] = None) -> None:
+    def plot(self, include_fit: bool = True, **kwargs) -> None:
         if include_fit and self.fitting_possible:
             model = self.create_model_from_fit()
         else:
@@ -2430,12 +2517,10 @@ class MeasurementTable:
                          axis=-1) / self.temperature_rate_table.shape[-1]
         valid_mask = np.isfinite(temperature_rates)
 
-        fig, ax = plt.subplots()
-
         colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
         color_idx = 0
 
-        data = dict(artists=[])
+        artists = []
 
         for idx in range(temperature_rates.shape[0]):
             if not np.any(valid_mask[idx, :]):
@@ -2447,9 +2532,9 @@ class MeasurementTable:
                 idx, :]]
             valid_weights = weights[idx, :][valid_mask[idx, :]]
 
-            data['artists'].append(
+            artists.append(
                 dict(type='scatter',
-                     x_values=temperature_diffs,
+                     x_values=valid_temperature_diffs,
                      y_values=valid_temperature_rates *
                      dt.timedelta(hours=1).total_seconds(),
                      s=20 * valid_weights,
@@ -2457,7 +2542,7 @@ class MeasurementTable:
                      label=f'{self.heating_power_bin_edges[idx]:g} W'))
 
             if model is not None and np.sum(valid_mask[idx, :]) > 3:
-                data['artists'].append(
+                artists.append(
                     dict(x_values=valid_temperature_diffs,
                          y_values=model(self.heating_power_bin_edges[idx],
                                         valid_temperature_diffs) *
@@ -2467,16 +2552,10 @@ class MeasurementTable:
 
             color_idx += 1
 
-        xlabel = 'Temperature difference [K]'
-        ylabel = 'Temperature rate of change [K/hour]'
-
-        ax.legend(loc='best')
-
-        fig.tight_layout()
-        if output_path is None:
-            plt.show()
-        else:
-            fig.savefig(output_path)
+        plot(*artists,
+             xlabel='Temperature difference [°C]',
+             ylabel='Temperature rate of change [°C/hour]',
+             **kwargs)
 
     @staticmethod
     def _fitting_possible_with_valid_mask(valid_mask: np.ndarray) -> bool:
@@ -2628,7 +2707,86 @@ class NewtonHeatingModel:
 
         return temperatures
 
-    def _compute_evolution_analytically(
+    def compute_evolution_with_thermostat(
+            self,
+            times: np.ndarray,
+            outside_temperatures: np.ndarray,
+            initial_temperature: float,
+            thermostat_mode_a_min_temperature: float,
+            thermostat_mode_b_min_temperature: float,
+            thermostat_mode_a_start_indices: np.ndarray,
+            thermostat_mode_a_end_indices: np.ndarray,
+            logger=print,
+            **kwargs):
+        assert thermostat_mode_a_start_indices.ndim == 1
+        assert thermostat_mode_a_start_indices.shape == thermostat_mode_a_end_indices.shape
+
+        if thermostat_mode_a_start_indices.size == 0:
+            starts_in_mode_b = True
+            transition_indices = np.array([0, times.size - 1], dtype=int)
+        else:
+            starts_in_mode_b = thermostat_mode_a_start_indices[
+                0] > 0 and thermostat_mode_a_start_indices[
+                    0] <= thermostat_mode_a_end_indices[0]
+
+            n_start_indices = thermostat_mode_a_start_indices.size
+            n_end_indices = thermostat_mode_a_end_indices.size
+            has_exterior_start_idx = int(
+                thermostat_mode_a_start_indices[0] == 0)
+            has_exterior_end_idx = int(
+                thermostat_mode_a_end_indices[-1] == times.size - 1)
+
+            transition_indices = np.zeros(n_start_indices + n_end_indices +
+                                          (1 - has_exterior_start_idx) +
+                                          (1 - has_exterior_end_idx),
+                                          dtype=int)
+            transition_indices[0] = 0
+            transition_indices[-1] = times.size - 1
+
+            if thermostat_mode_a_start_indices[
+                    0] <= thermostat_mode_a_end_indices[0]:
+                transition_indices[1:-1:2] = thermostat_mode_a_start_indices[
+                    has_exterior_start_idx:]
+                transition_indices[
+                    2:-1:
+                    2] = thermostat_mode_a_end_indices[:n_end_indices -
+                                                       has_exterior_end_idx]
+            else:
+                transition_indices[1:-1:2] = thermostat_mode_a_end_indices
+                transition_indices[2:-1:2] = thermostat_mode_a_start_indices
+
+        thermostat_min_temperatures = np.zeros(transition_indices.size - 1,
+                                               dtype=float)
+        if starts_in_mode_b:
+            thermostat_min_temperatures[
+                0::2] = thermostat_mode_b_min_temperature
+            thermostat_min_temperatures[
+                1::2] = thermostat_mode_a_min_temperature
+        else:
+            thermostat_min_temperatures[
+                0::2] = thermostat_mode_a_min_temperature
+            thermostat_min_temperatures[
+                1::2] = thermostat_mode_b_min_temperature
+
+        slice_initial_temperature = initial_temperature
+
+        temperatures = np.zeros_like(times)
+
+        for thermostat_min_temperature, start_idx, end_idx in zip(
+                thermostat_min_temperatures, transition_indices[:-1],
+                transition_indices[1:]):
+            thermostat_time_slice = slice(start_idx, end_idx + 1)
+            temperatures[thermostat_time_slice] = np.maximum(
+                thermostat_min_temperature,
+                self.compute_evolution(
+                    times[thermostat_time_slice],
+                    outside_temperatures[thermostat_time_slice],
+                    slice_initial_temperature, **kwargs))
+            slice_initial_temperature = temperatures[end_idx]
+
+        return temperatures
+
+    def compute_evolution(
             self,
             times: np.ndarray,
             outside_temperatures: np.ndarray,
@@ -2667,6 +2825,9 @@ class NewtonHeatingModel:
                 heating_end_time = max(
                     heating_start_time,
                     min(final_time, heating_end_time + self.heating_delay))
+
+                if heating_start_time == heating_end_time:
+                    continue
 
                 heating_start_time -= initial_time
                 heating_end_time -= initial_time
@@ -2798,7 +2959,7 @@ if __name__ == '__main__':
     temperatures_numerical = heating_model._compute_evolution_numerically(
         times, outside_temperatures, initial_temperature, heating_power,
         heating_start_time, heating_duration)
-    temperatures_analytical = heating_model._compute_evolution_analytically(
+    temperatures_analytical = heating_model.compute_evolution(
         times, outside_temperatures, initial_temperature, heating_power,
         heating_start_time, heating_duration)
     print(temperatures_analytical[-1])
