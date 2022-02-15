@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import pathlib
 import pickle
@@ -892,5 +893,6 @@ def create_dashboard():
 
 
 if __name__ == '__main__':
+    debug = '-d' in sys.argv[1:] or '--debug' in sys.argv[1:]
     dashboard = create_dashboard()
-    dashboard.run_server(debug=True)
+    dashboard.run_server(host='0.0.0.0', debug=debug)
