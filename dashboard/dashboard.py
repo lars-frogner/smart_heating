@@ -1,15 +1,11 @@
 import os
-import sys
-import glob
 import re
 import pathlib
 import pickle
 import collections
 import numpy as np
 import ruamel.yaml
-import plotly.graph_objects as go
 import plotly.subplots as ps
-import plotly.express as px
 import matplotlib
 import dash
 from dash import html, dcc
@@ -32,7 +28,7 @@ def read_lines(input_path, n_last_lines=None, position_pointer=None):
         if position_pointer is not None:
             f.seek(position_pointer)
 
-        for line_num, line in enumerate(f):
+        for line in f:
             lines.append(line)
 
         position_pointer = f.tell()
@@ -302,7 +298,7 @@ class SmartHeatingController:
             return {
                 'module': 'smart_heating',
                 'class': 'SmartHeating',
-                'tibber_access_token': '!secret tibber_access_token'
+                'tibber_access_token': yaml.load('!secret tibber_access_token')
             }
 
     def save_config(self, room_name, config):
@@ -810,7 +806,7 @@ def create_dashboard():
                 if input_value in ('', None):
                     config.pop(name, None)
                 else:
-                    config[name] = input_value
+                    config[name] = ruamel.yaml.scalarstring.SingleQuotedScalarString(input_value) if isinstance(input_value, str) else input_value
 
             controller.save_config(room_name, config)
 
