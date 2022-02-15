@@ -1,3 +1,47 @@
-label{
-  font-weight: bold;
+.log-container{
+  height: 20rem;
+  overflow: auto;
+  display: flex;
+  flex-direction: column-reverse;
+  background-color: rgba(0, 0, 0, 0.5);
+}
+
+.log-container > div{
+  color: lightgray;
+}
+
+#min-temp-text{
+  color: dodgerblue;
+
+}
+#comfort-temp-text{
+  color: forestgreen;
+}
+
+#max-temp-text{
+  color: crimson;
+}
+
+.time-input{
+  width: 6rem;
+}
+
+.number-input{
+  width: 7rem;
+}
+
+.entity-id-label{
+  width: 11rem;
+}
+
+.entity-id-input{
+  width: 25rem;
+}
+
+#temp-container{
+  max-width: 150vh;
+}
+
+#new-room-input{
+  width: 12rem;
 }
