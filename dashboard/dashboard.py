@@ -3,6 +3,7 @@ import re
 import pathlib
 import pickle
 import collections
+import subprocess
 import numpy as np
 import ruamel.yaml
 import plotly.subplots as ps
@@ -258,40 +259,44 @@ class SmartHeatingController:
     MAIN_LOG_PATH = LOG_DIR / 'appdaemon.log'
     ERROR_LOG_PATH = LOG_DIR / 'error.log'
     CONFIG_DIR = SCRIPT_DIR.parent / 'config'
+    HA_DIR = SCRIPT_DIR.parent.parent.parent.parent.parent
+    HA_CONFIG_DIR = HA_DIR / 'ha_config'
+    HA_THERMOSTAT_CONFIG_PATH = HA_CONFIG_DIR / 'climate.yaml'
 
     ENTITY_ID_NAMES = [
-        'thermostat_id', 'heater_id', 'weather_id', 'outside_thermometer_id',
+        'thermometer_id', 'heater_id', 'weather_id', 'outside_thermometer_id',
         'power_price_id', 'power_consumption_meter_id'
     ]
     ENTITY_ID_LABELS = [
-        'Thermostat', 'Heater', 'Weather service', 'Outdoor thermometer',
+        'Thermometer', 'Heater', 'Weather service', 'Outdoor thermometer',
         'Electricity price', 'Heater power consump.'
     ]
 
     def __init__(self):
         self.room_names = self.obtain_room_names()
         self.valid_room_name_regex = re.compile('^[a-z_]+$')
+        self.thermostat_config = self.obtain_thermostat_config()
 
     @property
     def main_log_path(self):
-        return self.__class__.MAIN_LOG_PATH
+        return self.MAIN_LOG_PATH
 
     @property
     def error_log_path(self):
-        return self.__class__.ERROR_LOG_PATH
+        return self.ERROR_LOG_PATH
 
     def obtain_room_names(self):
         return self.__class__.find_room_names()
-    
+
     def add_room(self, room_name):
         self.room_names.append(room_name)
         self.room_names.sort()
-    
+
     def room_name_is_valid(self, room_name):
         return self.valid_room_name_regex.match(room_name) is not None
 
     def obtain_config(self, room_name):
-        config_path = self.__class__.CONFIG_DIR / f'{room_name}.yaml'
+        config_path = self.CONFIG_DIR / f'{room_name}.yaml'
         if config_path.exists():
             return read_yaml(config_path)[room_name]
         else:
@@ -302,8 +307,61 @@ class SmartHeatingController:
             }
 
     def save_config(self, room_name, config):
-        config_path = self.__class__.CONFIG_DIR / f'{room_name}.yaml'
+        config_path = self.CONFIG_DIR / f'{room_name}.yaml'
         write_yaml(config_path, {room_name: config})
+
+    def obtain_thermostat_config(self):
+        config_path = self.HA_THERMOSTAT_CONFIG_PATH
+        if config_path.exists():
+            return read_yaml(config_path)
+        else:
+            return []
+
+    def update_thermostat_config(self,
+                                 room_name,
+                                 thermometer_entity_id,
+                                 heater_entity_id,
+                                 restart_ha_if_changed=False):
+        pretty_room_name = room_name.replace('_', ' ')
+        pretty_room_name = f'{room_name[0].upper()}{room_name[1:]}'
+
+        config_changed = False
+        room_entry_idx = None
+
+        for idx, entry in enumerate(self.thermostat_config):
+            if entry['name'] == pretty_room_name:
+                room_entry_idx = idx
+                break
+
+        if room_entry_idx is None:
+            self.thermostat_config.append(
+                dict(platform='generic_thermostat',
+                     name=ruamel.yaml.scalarstring.SingleQuotedScalarString(
+                         pretty_room_name),
+                     unique_id=f'{room_name}_thermostat',
+                     heater=heater_entity_id,
+                     target_sensor=thermometer_entity_id))
+            config_changed = True
+        else:
+            entry = self.thermostat_config[room_entry_idx]
+
+            if entry.get('heater', None) != heater_entity_id:
+                entry['heater'] = heater_entity_id
+                config_changed = True
+
+            if entry.get('target_sensor', None) != thermometer_entity_id:
+                entry['target_sensor'] = thermometer_entity_id
+                config_changed = True
+
+        if config_changed:
+            self.save_thermostat_config()
+            if restart_ha_if_changed:
+                subprocess.check_call(
+                    ['docker-compose', 'restart', 'homeassistant'],
+                    cwd=self.HA_DIR)
+
+    def save_thermostat_config(self):
+        write_yaml(self.HA_THERMOSTAT_CONFIG_PATH, self.thermostat_config)
 
     def set_log_position_pointer(self, log_name, position_pointer):
         setattr(self, f'{log_name}_log_position_pointer', position_pointer)
@@ -387,33 +445,36 @@ def create_dashboard():
         if len(room_names) == 0:
             return None
         else:
-            return dbc.Select(id='room-select',
-                                      value=(room_names[0] if selected_room_name is None else selected_room_name),
-                                      options=[
-                                          dict(label=room_name,
-                                               value=room_name)
-                                          for room_name in room_names
-                                      ])
+            return dbc.Select(
+                id='room-select',
+                value=(room_names[0]
+                       if selected_room_name is None else selected_room_name),
+                options=[
+                    dict(label=room_name, value=room_name)
+                    for room_name in room_names
+                ])
 
     def create_room_menu():
         return dbc.Container([
             dbc.Row(dbc.Col(html.H3('Room'), className='mt-3 mb-2')),
             dbc.Row([
-                dbc.Col(create_room_select(), id='room-select-container',
-                           className='col-auto me-3'),
+                dbc.Col(create_room_select(),
+                        id='room-select-container',
+                        className='col-auto me-3'),
                 dbc.Col(
                     dbc.Row([
-                        dbc.Col(
-                            [dbc.Input(id='new-room-input',
+                        dbc.Col([
+                            dbc.Input(id='new-room-input',
                                       placeholder='New room name'),
                             dbc.FormFeedback(
-                        'Room name must be unique with only letters and underscores',
-                        type='invalid',
-                    )], className='col-auto pe-0'),
-                        dbc.Col(
-                            dbc.Button('Create new',
-                                       id='new-room-button',
-                                       disabled=True), className='col-auto')
+                                'Room name must be unique with only letters and underscores',
+                                type='invalid',
+                            )
+                        ],
+                                className='col-auto pe-0'),
+                        dbc.Col(dbc.Button(
+                            'Create new', id='new-room-button', disabled=True),
+                                className='col-auto')
                     ]))
             ])
         ],
@@ -801,12 +862,27 @@ def create_dashboard():
             config['hard_reset'] = 'hard_reset' in options
             config['debug'] = 'debug' in options
 
-            for input_id, input_value in zip(all_input_ids, input_values):
+            thermostat_entity_id = f'climate.{room_name}'
+            thermometer_entity_id = input_values[-len(entity_id_input_ids):][
+                controller.ENTITY_ID_NAMES.index('thermometer_id')]
+            heater_entity_id = input_values[-len(entity_id_input_ids):][
+                controller.ENTITY_ID_NAMES.index('heater_id')]
+            controller.update_thermostat_config(room_name,
+                                                thermometer_entity_id,
+                                                heater_entity_id,
+                                                restart_ha_if_changed=True)
+
+            for input_id, input_value in zip(
+                    all_input_ids + ['thermostat_id'],
+                    list(input_values) + [thermostat_entity_id]):
                 name = input_id[:-6]
                 if input_value in ('', None):
                     config.pop(name, None)
                 else:
-                    config[name] = ruamel.yaml.scalarstring.SingleQuotedScalarString(input_value) if isinstance(input_value, str) else input_value
+                    config[
+                        name] = ruamel.yaml.scalarstring.SingleQuotedScalarString(
+                            input_value) if isinstance(input_value,
+                                                       str) else input_value
 
             controller.save_config(room_name, config)
 
