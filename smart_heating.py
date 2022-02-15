@@ -2,6 +2,7 @@ import os
 import sys
 import asyncio
 import pickle
+import shutil
 import datetime as dt
 import pytz
 from typing import Union, Any, Optional, Tuple, Callable
@@ -185,6 +186,14 @@ def remaining_seconds_to_time(current_datetime, time):
             current_datetime).total_seconds()
 
 
+def delete_all_files_in_folder(folder_path):
+    for file_path in folder_path.glob('**/*'):
+        if file_path.is_file():
+            file_path.unlink()
+        elif file_path.is_dir():
+            shutil.rmtree(file_path)
+
+
 class SmartHeating(hass.Hass):
 
     def initialize(self):
@@ -210,7 +219,7 @@ class SmartHeating(hass.Hass):
 
         self.power_price = None
 
-        self.modeling_time_interval = dt.timedelta(minutes=10).total_seconds()
+        self.modeling_time_interval = dt.timedelta(minutes=0.1).total_seconds()
         self.modeling_buffer_time = 0.5 * dt.timedelta(hours=1).total_seconds()
 
         self.scheduled_heating_period = None
@@ -224,12 +233,15 @@ class SmartHeating(hass.Hass):
         if self.debug:
             self.set_log_level('DEBUG')
 
+        if self.hard_reset:
+            self.delete_all_data()
+
         if self.run:
             self.run_in(self.start_running, 0)
 
         if self.plot_interval is not None:
             if self.has_model() or self.setup_time is not None or not self.run:
-                self.create_plot_data()
+                self.run_in(self.create_plot_data, 15)
 
             self.run_every(self.create_plot_data,
                            f'now+{int(self.plot_interval)}',
@@ -256,6 +268,7 @@ class SmartHeating(hass.Hass):
     def _handle_input_args(self):
         self.debug = self.args.get('debug', False)
         self.run = self.args.get('run', True)
+        self.hard_reset = self.args.get('hard_reset', False)
 
         self.mode = self.args.get('mode', 'optimal')
         if self.mode not in self.valid_modes:
@@ -264,6 +277,8 @@ class SmartHeating(hass.Hass):
             )
 
         self.plot_interval = self.args.get('plot_interval', None)
+        if self.plot_interval == 0:
+            self.plot_interval = None
 
         setup_time_str = self.args.get('setup_time', self._read_setup_time())
         if setup_time_str is None:
@@ -292,6 +307,8 @@ class SmartHeating(hass.Hass):
         self.thermostat = self.get_entity(self.args['thermostat_id'])
 
         if self.mode != 'classic':
+            self.heating_power = self.args['heating_power']
+            
             self.heater = self.get_entity(self.args['heater_id'])
 
             self.weather = self.get_entity(self.args['weather_id'])
@@ -303,7 +320,6 @@ class SmartHeating(hass.Hass):
             self.power_consumption_meter = self.get_entity(
                 self.args['power_consumption_meter_id']
             ) if 'power_consumption_meter_id' in self.args else None
-            self.heating_power = self.args.get('heating_power', None)
 
             self.power_price_sensor = self.get_entity(
                 self.args.get('power_price_id',
@@ -311,6 +327,12 @@ class SmartHeating(hass.Hass):
 
             self.tibber_access_token = self.args.get('tibber_access_token',
                                                      None)
+
+    def delete_all_data(self):
+        for folder in [
+                self.data_path, self.figure_path, self.figure_data_path
+        ]:
+            delete_all_files_in_folder(folder)
 
     def start_running(self, *args):
 
@@ -653,7 +675,7 @@ class SmartHeating(hass.Hass):
         comfort_period_end_indices = list(
             np.nonzero(in_comfort_period[1:] < in_comfort_period[:-1])[0])
         if in_comfort_period[-1]:
-            comfort_period_end_indices.append(-1)
+            comfort_period_end_indices.append(in_comfort_period.size-1)
 
         return np.array(comfort_period_start_indices,
                         dtype=int), np.array(comfort_period_end_indices,
@@ -1111,7 +1133,7 @@ class SmartHeating(hass.Hass):
                             future_datetimes),
                         heating_powers=max_heating_power,
                         heating_start_times=heating_start_time,
-                        heating_end_times=heating_end_time)
+                        heating_end_times=heating_end_time, logger=self.log)
                 else:
                     modeled_temperatures = model.compute_evolution(
                         future_times,
@@ -1128,7 +1150,7 @@ class SmartHeating(hass.Hass):
                              y_values=planned_heating_powers,
                              y_threshold=50.0,
                              color='tab:red',
-                             alpha=0.2))
+                             alpha=0.5))
 
                 if 'monitoring_time' in indicators and self.next_monitoring_time is not None:
                     artists.append(
@@ -1508,8 +1530,7 @@ class SmartHeating(hass.Hass):
         self.log('Creating temperature representation', level='DEBUG')
         return self._create_sensor_state_representation(
             str(self.thermostat),
-            extractor=lambda entry: float(entry['attributes'][
-                'current_temperature']),
+            extractor=lambda entry: entry['attributes']['current_temperature'],
             **kwargs)
 
     def _create_outside_temperature_representation(
@@ -1539,7 +1560,8 @@ class SmartHeating(hass.Hass):
                 self._terminate_with_error('No heating power specified')
             times, values = self._fetch_historical_state(
                 str(self.heater),
-                extractor=lambda entry: int(entry['state'] == 'on'),
+                extractor=lambda entry: entry['state'] == 'on',
+                value_type=int,
                 **kwargs)
             values = np.asarray(values) * self.heating_power
             interp_kind = 'previous'
@@ -1577,7 +1599,7 @@ class SmartHeating(hass.Hass):
         return self._create_sensor_state_representation(
             str(self.weather),
             smoothing_window_duration=None,
-            extractor=lambda entry: float(entry['attributes']['temperature']),
+            extractor=lambda entry: entry['attributes']['temperature'],
             **kwargs)
 
     def _update_temperature_forecast(self, **kwargs):
@@ -1655,7 +1677,8 @@ class SmartHeating(hass.Hass):
                                 start_time=None,
                                 end_time=None,
                                 hours_back=24.0,
-                                extractor=lambda entry: float(entry['state'])):
+                                extractor=lambda entry: entry['state'],
+                                value_type=float):
         end_time = self.datetime() if end_time is None else end_time
         start_time = (end_time - dt.timedelta(hours=hours_back)
                       ) if start_time is None else start_time
@@ -1665,10 +1688,14 @@ class SmartHeating(hass.Hass):
             start_time=self._localize_datetime(start_time),
             end_time=self._localize_datetime(end_time))[0]
 
-        times, values = zip(*((self.convert_utc(entry['last_updated']),
-                               extractor(entry)) for entry in history
-                              if entry['state'] not in ('unavailable',
-                                                        'unknown', '')))
+        times = []
+        values = []
+        for entry in history:
+            if entry['state'] not in ('unavailable', 'unknown', ''):
+                value = extractor(entry)
+                if value is not None:
+                    times.append(self.convert_utc(entry['last_updated']))
+                    values.append(value_type(value))
 
         return times, values
 
@@ -2696,7 +2723,7 @@ class NewtonHeatingModel:
 
         for i in range(times.size - 1):
             time = times[i]
-            source_term = 0.0 if (
+            source_term = self.source_term if (
                 time < heating_start or time > heating_end) else (
                     self.heating_source_coef * heating_power +
                     self.source_term)
@@ -2743,28 +2770,27 @@ class NewtonHeatingModel:
             transition_indices[0] = 0
             transition_indices[-1] = times.size - 1
 
-            if thermostat_mode_a_start_indices[
-                    0] <= thermostat_mode_a_end_indices[0]:
-                transition_indices[1:-1:2] = thermostat_mode_a_start_indices[
-                    has_exterior_start_idx:]
+            if starts_in_mode_b:
+                transition_indices[1:-2:2] = thermostat_mode_a_start_indices
+                transition_indices[2:-1:2] = thermostat_mode_a_end_indices
+            else:
+                transition_indices[1:-2:2] = thermostat_mode_a_end_indices[:n_end_indices -
+                                                       has_exterior_end_idx]
                 transition_indices[
                     2:-1:
-                    2] = thermostat_mode_a_end_indices[:n_end_indices -
-                                                       has_exterior_end_idx]
-            else:
-                transition_indices[1:-1:2] = thermostat_mode_a_end_indices
-                transition_indices[2:-1:2] = thermostat_mode_a_start_indices
+                    2] = thermostat_mode_a_start_indices[
+                    has_exterior_start_idx:]
 
         thermostat_min_temperatures = np.zeros(transition_indices.size - 1,
                                                dtype=float)
         if starts_in_mode_b:
             thermostat_min_temperatures[
-                0::2] = thermostat_mode_b_min_temperature
+                :-1:2] = thermostat_mode_b_min_temperature
             thermostat_min_temperatures[
                 1::2] = thermostat_mode_a_min_temperature
         else:
             thermostat_min_temperatures[
-                0::2] = thermostat_mode_a_min_temperature
+                :-1:2] = thermostat_mode_a_min_temperature
             thermostat_min_temperatures[
                 1::2] = thermostat_mode_b_min_temperature
 
@@ -2786,14 +2812,13 @@ class NewtonHeatingModel:
 
         return temperatures
 
-    def compute_evolution(
-            self,
-            times: np.ndarray,
-            outside_temperatures: np.ndarray,
-            initial_temperature: float,
-            heating_powers: Optional[np.ndarray] = None,
-            heating_start_times: Optional[np.ndarray] = None,
-            heating_end_times: Optional[np.ndarray] = None) -> np.ndarray:
+    def compute_evolution(self,
+                          times: np.ndarray,
+                          outside_temperatures: np.ndarray,
+                          initial_temperature: float,
+                          heating_powers: Optional[np.ndarray] = None,
+                          heating_start_times: Optional[np.ndarray] = None,
+                          heating_end_times: Optional[np.ndarray] = None) -> np.ndarray:
         assert times.shape == outside_temperatures.shape
 
         initial_time = times[0]
@@ -2875,9 +2900,10 @@ class NewtonHeatingModel:
 
         return (final_temperature * final_inv_exp_factor -
                 initial_temperature + self.transfer_coef *
-                np.trapz(outside_temperatures * inv_exp_factor, x=times)) / (
-                    self.heating_source_coef * heating_power +
-                    self.source_term)
+                np.trapz(outside_temperatures * inv_exp_factor, x=times) +
+                self.source_term *
+                (final_inv_exp_factor - 1.0) / self.transfer_coef) / (
+                    self.heating_source_coef * heating_power)
 
     def _compute_required_heating_duration_from_start_time(
             self,
