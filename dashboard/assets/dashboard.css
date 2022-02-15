@@ -36,6 +36,7 @@
 
 .entity-id-input{
   width: 25rem;
+  max-width: 95vw;
 }
 
 #temp-container{

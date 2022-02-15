@@ -189,7 +189,7 @@ def mpl_to_plotly_layout(mpl_layout):
 def create_figure(*graph_objects, layout={}):
     uses_secondary_y = len(
         list(filter(lambda g: g.get('secondary_y', False), graph_objects))) > 0
-    fig = ps.make_subplots(specs=[[{"secondary_y": uses_secondary_y}]])
+    fig = ps.make_subplots(specs=[[{'secondary_y': uses_secondary_y}]])
 
     used_names = []
     for graph_object in graph_objects:
@@ -424,7 +424,7 @@ def create_dashboard():
 
     def create_log_switch():
         return dbc.Row(
-            dbc.Col(dbc.Switch(id="log-switch", label="Show", value=False)))
+            dbc.Col(dbc.Switch(id='log-switch', label='Show', value=False)))
 
     def create_logs():
         return dbc.Container([
@@ -476,13 +476,19 @@ def create_dashboard():
                         dbc.Col(dbc.Button(
                             'Create new', id='new-room-button', disabled=True),
                                 className='col-auto')
-                    ]))
+                    ]), className='my-2')
             ])
         ],
                              className='px-0 mb-4')
 
     dashboard = dash.Dash(__name__,
                           external_stylesheets=[dbc.themes.DARKLY],
+                          meta_tags=[{
+                              'name':
+                              'viewport',
+                              'content':
+                              'width=device-width, initial-scale=1'
+                          }],
                           suppress_callback_exceptions=True)
 
     dashboard.layout = dbc.Container([
