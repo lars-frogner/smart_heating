@@ -247,7 +247,7 @@ class SmartHeating(hass.Hass):
                            f'now+{int(self.plot_interval)}',
                            self.plot_interval)
 
-        self.log('SmartHeating initialized', level='DEBUG')
+        self.log('SmartHeating initialized', level='INFO')
 
     def _init_paths(self):
         self.root_path = Path(self.app_dir) / 'smart_heating' / self.name
@@ -1686,16 +1686,20 @@ class SmartHeating(hass.Hass):
         history = self.get_history(
             entity_id=entity_id,
             start_time=self._localize_datetime(start_time),
-            end_time=self._localize_datetime(end_time))[0]
+            end_time=self._localize_datetime(end_time))
 
         times = []
         values = []
-        for entry in history:
-            if entry['state'] not in ('unavailable', 'unknown', ''):
-                value = extractor(entry)
-                if value is not None:
-                    times.append(self.convert_utc(entry['last_updated']))
-                    values.append(value_type(value))
+
+        if len(history) > 0:
+            history = history[0]
+
+            for entry in history:
+                if entry['state'] not in ('unavailable', 'unknown', ''):
+                    value = extractor(entry)
+                    if value is not None:
+                        times.append(self.convert_utc(entry['last_updated']))
+                        values.append(value_type(value))
 
         return times, values
 
