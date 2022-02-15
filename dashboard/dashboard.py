@@ -235,25 +235,16 @@ def create_figure(*graph_objects, layout={}):
 
 def mpl_to_plotly_figure(data):
     artists = data.pop('artists')
-    # for artist in artists:
-    #     print(artist.get('type', None))
     sorted_artists = []
     for type_name in ['fill', 'hline', 'vline', 'scatter', 'plot']:
         for artist in artists:
             if artist.get('type', 'plot') == type_name and artist.get('ax',
                                                                       0) == 0:
-                # if artist.get('label',
-                #               None) not in ('Temp. forecast', 'Temp. outside',
-                #                             'Temp. inside'):
                 sorted_artists.append(artist)
         for artist in artists:
             if artist.get('type', 'plot') == type_name and artist.get('ax',
                                                                       0) == 1:
                 sorted_artists.append(artist)
-
-    # for artist in sorted_artists:
-    #     print(artist.get('type', None))
-    # print(len(artists), len(sorted_artists))
 
     graph_objects = filter(lambda obj: obj is not None,
                            (mpl_artist_to_plotly_graph_object(artist)
@@ -424,7 +415,7 @@ def create_dashboard():
                         type='invalid',
                     )], className='col-auto pe-0'),
                         dbc.Col(
-                            dbc.Button('Add new',
+                            dbc.Button('Create new',
                                        id='new-room-button',
                                        disabled=True), className='col-auto')
                     ]))
