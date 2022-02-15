@@ -176,3 +176,4 @@ cython_debug/
 data/
 figures/
 figure_data/
+config/
