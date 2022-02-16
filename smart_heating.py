@@ -233,19 +233,17 @@ class SmartHeating(hass.Hass):
         if self.debug:
             self.set_log_level('DEBUG')
 
-        if self.hard_reset:
+        if self.rebuild_model:
             self.delete_all_data()
-
-        if self.run:
+            self.run_in(self.gather_data_for_initial_model, 0)
+        elif self.control_heating:
             self.run_in(self.start_running, 0)
 
-        if self.plot_interval is not None:
-            if self.has_model() or self.setup_time is not None or not self.run:
-                self.run_in(self.create_plot_data, 15)
+        if self.keep_model_updated:
+            self.schedule_model_updates()
 
-            self.run_every(self.create_plot_data,
-                           f'now+{int(self.plot_interval)}',
-                           self.plot_interval)
+        if self.plot_interval is not None:
+            self.schedule_plot_data_updates()
 
         self.log('SmartHeating initialized', level='INFO')
 
@@ -267,8 +265,9 @@ class SmartHeating(hass.Hass):
 
     def _handle_input_args(self):
         self.debug = self.args.get('debug', False)
-        self.run = self.args.get('run', True)
-        self.hard_reset = self.args.get('hard_reset', False)
+        self.control_heating = self.args.get('control_heating', True)
+        self.rebuild_model = self.args.get('rebuild_model', False)
+        self.keep_model_updated = self.args.get('keep_model_updated', True)
 
         self.mode = self.args.get('mode', 'optimal')
         if self.mode not in self.valid_modes:
@@ -339,16 +338,13 @@ class SmartHeating(hass.Hass):
         if self.mode == 'classic':
             self.begin_operation()
         else:
-            self.run_daily(self.update_models_callback,
-                           self.comfort_start_time)
-
             if not self.has_model() and self.setup_time is None:
                 self.gather_data_for_initial_model()
             else:
                 self.update_models_and_begin_operation()
 
-    def gather_data_for_initial_model(self):
-        self.log('Gathering data for initial model', level='DEBUG')
+    def gather_data_for_initial_model(self, *args):
+        self.log('Gathering data for initial model', level='INFO')
 
         self.setup_time = self._local_now()
 
@@ -413,11 +409,28 @@ class SmartHeating(hass.Hass):
 
     def _complete_data_gathering(self):
         self._write_setup_time(self.setup_time)
-        self.update_models_and_begin_operation(exclude_comfort_period=False)
+        
+        self.update_models(exclude_comfort_period=False)
+
+        if self.control_heating:
+            self.begin_operation()
 
     def update_models_and_begin_operation(self, **kwargs):
         self.update_models(**kwargs)
         self.begin_operation()
+    
+    def schedule_plot_data_updates(self):
+        if self.has_model() or self.setup_time is not None or (not self.control_heating and not self.rebuild_model):
+            self.run_in(self.create_plot_data, 20)
+
+        self.run_every(self.create_plot_data,
+                        f'now+{int(self.plot_interval)}',
+                        self.plot_interval)
+    
+    def schedule_model_updates(self):
+        if self.mode != 'classic':
+            self.run_daily(self.update_models_callback,
+                            self.comfort_start_time)
 
     def update_models_callback(self, kwargs):
         self.update_models(**kwargs)
@@ -1122,7 +1135,7 @@ class SmartHeating(hass.Hass):
                         future_times >= self.scheduled_heating_period[0],
                         future_times < sum(self.scheduled_heating_period))
 
-                if self.run:
+                if self.control_heating:
                     modeled_temperatures = model.compute_evolution_with_thermostat(
                         future_times,
                         outside_temperatures,

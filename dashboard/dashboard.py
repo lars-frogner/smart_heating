@@ -457,11 +457,11 @@ def create_dashboard():
 
     def create_room_menu():
         return dbc.Container([
-            dbc.Row(dbc.Col(html.H3('Room'), className='mt-3 mb-2')),
+            dbc.Row(dbc.Col(html.H3('Room'), className='mt-3')),
             dbc.Row([
                 dbc.Col(create_room_select(),
                         id='room-select-container',
-                        className='col-auto me-3'),
+                        className='col-auto me-3 my-2'),
                 dbc.Col(
                     dbc.Row([
                         dbc.Col([
@@ -744,10 +744,11 @@ def create_dashboard():
                              className='px-0')
 
     def create_options_checklist(room_config):
-        run = room_config.get('run', True)
+        control_heating = room_config.get('control_heating', True)
         debug = room_config.get('debug', False)
-        hard_reset = room_config.get('hard_reset', False)
-        value_map = dict(run=run, hard_reset=hard_reset, debug=debug)
+        rebuild_model = room_config.get('rebuild_model', False)
+        keep_model_updated = room_config.get('keep_model_updated', True)
+        value_map = dict(control_heating=control_heating, keep_model_updated=keep_model_updated, rebuild_model=rebuild_model, debug=debug)
         values = [name for name, value in value_map.items() if value]
         return dbc.Container([
             dbc.Row(dbc.Col(html.H5('Options')), className='mt-3 mb-2'),
@@ -756,8 +757,9 @@ def create_dashboard():
                     id='options-checklist',
                     value=values,
                     options=[
-                        dict(label='Control heating', value='run'),
-                        dict(label='Rebuild model', value='hard_reset'),
+                        dict(label='Control heating', value='control_heating'),
+                        dict(label='Keep model updated', value='keep_model_updated'),
+                        dict(label='Rebuild model', value='rebuild_model'),
                         dict(label='Log debug messages', value='debug')
                     ],
                     switch=True),
@@ -865,8 +867,9 @@ def create_dashboard():
 
             config['mode'] = mode
 
-            config['run'] = 'run' in options
-            config['hard_reset'] = 'hard_reset' in options
+            config['control_heating'] = 'control_heating' in options
+            config['keep_model_updated'] = 'keep_model_updated' in options
+            config['rebuild_model'] = 'rebuild_model' in options
             config['debug'] = 'debug' in options
 
             thermostat_entity_id = f'climate.{room_name}'
