@@ -1755,6 +1755,74 @@ class SmartHeating(hass.Hass):
             return ForecastCorrection(save_path=self.forecast_correction_path)
 
 
+class ThermostatSetting:
+
+    @staticmethod
+    def from_temperature_array(start_datetime: dt.datetime, interval: dt.timedelta, temperatures: np.ndarray, cyclic: bool = False) -> 'ThermostatSetting':
+        assert temperatures.size > 0
+        
+        if temperatures.size == 1:
+            transition_times = np.full(1, interval.total_seconds())
+            temperature_settings = temperatures
+        else:
+            next_transition_indices = np.nonzero(temperatures[1:] != temperatures[:-1]) + 1
+            transition_indices = np.zeros(next_transition_indices.size + 1, dtype=next_transition_indices.dtype)
+            transition_indices[1:] = next_transition_indices
+            transition_times = interval.total_seconds()*transition_indices
+            temperature_settings = temperatures[transition_indices]
+        
+        return ThermostatSetting(start_datetime, transition_times, temperature_settings)
+
+    def __init__(self, start_datetime: dt.datetime, transition_times: np.ndarray, temperature_settings: np.ndarray, cyclic: bool = False) -> None:
+        self._start_datetime = start_datetime
+
+        self._transition_times = transition_times.copy()
+        self._temperature_settings = temperature_settings.copy()
+        
+        self._temperature_func = scipy.interpolate.interp1d(self._transition_times, self._temperature_settings, kind='previous', fill_value='extrapolate', assume_sorted=True, copy=False)
+
+    def _datetime_to_relative_time(self, datetime: dt.datetime) -> float:
+        return (datetime - self._start_datetime).total_seconds()
+
+    def _relative_time_to_datetime(self, time: float) -> dt.datetime:
+        return self._start_datetime + dt.timedelta(seconds=time)
+
+    def _get_next_transition_idx(self, time: float, inclusive: bool = True) -> int:
+        return np.searchsorted(self._transition_times, time, side=('left' if inclusive else 'right'))
+
+    def _get_previous_transition_idx(self, time: float, inclusive: bool = True) -> int:
+        return np.searchsorted(self._transition_times, time, side=('right' if inclusive else 'left')) - 1
+
+    def get_temperature(self, datetime: dt.datetime) -> float:
+        return self._temperature_func(self._datetime_to_relative_time(datetime))
+
+    def get_next_transition_time(self, datetime: dt.datetime, inclusive: bool = True, return_temperature: bool = False) -> Union[dt.datetime, Tuple[dt.datetime, float]]:
+        time = self._datetime_to_relative_time(datetime)
+        next_time_idx = self._get_next_transition_idx(time, inclusive=inclusive)
+        next_transition_datetime = self._relative_time_to_datetime(self._transition_times[next_time_idx])
+        if return_temperature:
+            return next_transition_datetime, self._temperature_settings[next_time_idx]
+        else:
+            return next_transition_datetime
+
+    def get_next_transition(self, datetime: dt.datetime) -> Tuple[dt.datetime, float]:
+        return self.get_next_transition_time(datetime, return_temperature=True)
+
+    def for_subinterval(self, min_start_datetime: dt.datetime, max_end_datetime: dt.datetime) -> 'ThermostatSetting':
+        min_start_time = self._datetime_to_relative_time(min_start_datetime)
+        new_start_idx = self._get_next_transition_idx(min_start_time, inclusive=True)
+        new_start_datetime = self._relative_time_to_datetime(self._transition_times[new_start_idx])
+
+        max_end_time = self._datetime_to_relative_time(max_end_datetime)
+        new_end_idx = self._get_previous_transition_idx(max_end_time, inclusive=True)
+        
+        subinterval_slice = slice(new_start_idx, new_end_idx + 1)
+        return ThermostatSetting(new_start_datetime, self._transition_times[subinterval_slice], self._temperature_settings[subinterval_slice])
+
+    def __iter__(self) -> Iterable:
+        return ((self._relative_time_to_datetime(time), temperature) for time, temperature in zip(self._transition_times, self._temperature_settings))
+
+
 class ForecastCorrection:
 
     @staticmethod
