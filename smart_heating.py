@@ -1704,7 +1704,7 @@ class SmartHeating(hass.Hass):
         times = []
         values = []
 
-        if len(history) > 0:
+        if history is not None and len(history) > 0:
             history = history[0]
 
             for entry in history:
