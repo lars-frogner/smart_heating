@@ -5,7 +5,7 @@ import pickle
 import shutil
 import datetime as dt
 import pytz
-from typing import Union, Any, Optional, Tuple, Callable
+from typing import Union, Any, Optional, Tuple, Callable, Iterable
 from pathlib import Path
 import numpy as np
 import scipy.interpolate
@@ -436,12 +436,12 @@ class SmartHeating(hass.Hass):
         self.update_models(**kwargs)
 
     def update_models(self, **kwargs):
-        self.log('Updating models with data from previous day', level='DEBUG')
+        self.log('Updating models with data from previous day', level='INFO')
         self.update_model_with_historical_data(**kwargs)
         self.update_forecast_correction_with_historical_data()
 
     def begin_operation(self):
-        self.log('Beginning operation', level='DEBUG')
+        self.log('Beginning operation', level='INFO')
         if self._time_is_in_comfort_period():
             self._begin_comfort_period()
         else:
@@ -718,7 +718,7 @@ class SmartHeating(hass.Hass):
             if allow_forecast_fallback:
                 self.log(
                     'No outside thermometer, using current forecasted temperature as current outside temperature',
-                    level='WARNING')
+                    level='DEBUG')
                 return self.get_current_forecasted_temperature()
             else:
                 self._terminate_with_error(
@@ -764,7 +764,7 @@ class SmartHeating(hass.Hass):
         start_time = end_time - dt.timedelta(hours=hours_back)
 
         if self.setup_time is not None and start_time < self.setup_time:
-            self.log('Increasing start time to setup time', level='WARNING')
+            self.log('Increasing start time to setup time', level='DEBUG')
             start_time = self.setup_time
 
         recorder = self._create_recorder_with_historical_data(
@@ -775,7 +775,7 @@ class SmartHeating(hass.Hass):
             exclude_comfort_period=exclude_comfort_period)
 
         if recorder is None:
-            self.log('Duration too short, aborting', level='WARNING')
+            self.log('Duration too short, aborting', level='DEBUG')
             return
 
         table = self._obtain_measurement_table()
@@ -799,7 +799,7 @@ class SmartHeating(hass.Hass):
             new_model.save()
         else:
             self.log('Not enough data to fit measurement table',
-                     level='WARNING')
+                     level='DEBUG')
 
     def clear_forecast_correction(self):
         if self.forecast_correction_path.exists():
@@ -816,18 +816,18 @@ class SmartHeating(hass.Hass):
                  level='DEBUG')
 
         if self.outside_thermometer is None:
-            self.log('No outside thermometer, aborting', level='WARNING')
+            self.log('No outside thermometer, aborting', level='DEBUG')
             return
 
         end_time = self._local_now() if end_time is None else end_time
         start_time = end_time - dt.timedelta(days=days_back)
 
         if self.setup_time is not None and start_time < self.setup_time:
-            self.log('Increasing start time to setup time', level='WARNING')
+            self.log('Increasing start time to setup time', level='DEBUG')
             start_time = self.setup_time
 
         if end_time < start_time + dt.timedelta(days=min_required_days):
-            self.log('Duration too short, aborting', level='WARNING')
+            self.log('Duration too short, aborting', level='DEBUG')
             return
 
         forecasted_temperature_func = self._create_current_forecasted_temperature_representation(
@@ -839,7 +839,7 @@ class SmartHeating(hass.Hass):
             end_time=end_time)
 
         if forecasted_temperature_func is None or measured_temperature_func is None:
-            self.log('Duration too short, aborting', level='WARNING')
+            self.log('Duration too short, aborting', level='DEBUG')
             return
 
         ForecastCorrection.from_historical_temperatures(
@@ -906,14 +906,14 @@ class SmartHeating(hass.Hass):
         start_time = end_time - dt.timedelta(hours=hours_back)
 
         if self.setup_time is not None and start_time < self.setup_time:
-            self.log('Increasing start time to setup time', level='WARNING')
+            self.log('Increasing start time to setup time', level='DEBUG')
             start_time = self.setup_time
 
         recorder = self._create_recorder_with_historical_data(
             start_time, end_time, exclude_comfort_period=True)
 
         if recorder is None:
-            self.log('Duration too short, aborting', level='WARNING')
+            self.log('Duration too short, aborting', level='DEBUG')
             return
 
         processed_record = recorder.create_processed_record()
@@ -939,7 +939,7 @@ class SmartHeating(hass.Hass):
 
             if self.setup_time is not None and start_time < self.setup_time:
                 self.log('Increasing start time to setup time',
-                         level='WARNING')
+                         level='DEBUG')
                 start_time = self.setup_time
 
             recorder = self._create_recorder_with_historical_data(
@@ -947,7 +947,7 @@ class SmartHeating(hass.Hass):
 
             if recorder is None:
                 self.log('Past duration too short, skipping historical data',
-                         level='WARNING')
+                         level='DEBUG')
             else:
                 processed_record = recorder.create_processed_record()
                 past_datetimes = self.timestamps_to_local_datetimes(
@@ -983,7 +983,7 @@ class SmartHeating(hass.Hass):
                     if forecasted_temperature_func is None:
                         self.log(
                             'Past duration too short, skipping historical forecast',
-                            level='WARNING')
+                            level='DEBUG')
                     else:
                         correction = self._obtain_forecast_correction()
                         corrected_forecasted_temperature_func = correction.corrected(
@@ -1035,7 +1035,7 @@ class SmartHeating(hass.Hass):
                             second_ylabel = 'Price [NOK/kWh]'
                         else:
                             self.log('Power prices unavailable, skipping',
-                                     level='WARNING')
+                                     level='DEBUG')
                     else:
                         artists.append(
                             dict(ax=1,
@@ -1112,13 +1112,13 @@ class SmartHeating(hass.Hass):
                     second_ylabel = 'Price [NOK/kWh]'
                 else:
                     self.log('Power prices unavailable, skipping',
-                             level='WARNING')
+                             level='DEBUG')
 
             model = self._read_model()
 
             if model is None:
                 self.log('No model found, skipping projected data',
-                         level='WARNING')
+                         level='DEBUG')
             else:
                 initial_temperature = self.get_current_temperature()
 
@@ -1213,7 +1213,7 @@ class SmartHeating(hass.Hass):
             table = self._obtain_measurement_table()
             table.plot(**kwargs)
         else:
-            self.log('No measurements found, aborting', level='WARNING')
+            self.log('No measurements found, aborting', level='DEBUG')
 
     def plot_temperature_forecast(self, start_time=None, hours_ahead=24.0):
         self.log('Plotting temperature forecast', level='DEBUG')
@@ -1222,7 +1222,7 @@ class SmartHeating(hass.Hass):
 
         if self.setup_time is not None and start_time < self.setup_time:
             self.log('Start time earlier than setup time, aborting',
-                     level='WARNING')
+                     level='DEBUG')
             return
 
         times = np.linspace(datetime_to_timestamp(start_time),
@@ -1250,14 +1250,14 @@ class SmartHeating(hass.Hass):
             level='DEBUG')
 
         if self.outside_thermometer is None:
-            self.log('No outside thermometer, aborting', level='WARNING')
+            self.log('No outside thermometer, aborting', level='DEBUG')
             return
 
         end_time = self._local_now() if end_time is None else end_time
         start_time = end_time - dt.timedelta(hours=hours_back)
 
         if self.setup_time is not None and start_time < self.setup_time:
-            self.log('Increasing start time to setup time', level='WARNING')
+            self.log('Increasing start time to setup time', level='DEBUG')
             start_time = self.setup_time
 
         forecasted_temperature_func = self._create_current_forecasted_temperature_representation(
@@ -1269,7 +1269,7 @@ class SmartHeating(hass.Hass):
             end_time=end_time)
 
         if forecasted_temperature_func is None or measured_temperature_func is None:
-            self.log('Duration too short, aborting', level='WARNING')
+            self.log('Duration too short, aborting', level='DEBUG')
             return
 
         start_timestamp = datetime_to_timestamp(start_time)
@@ -1322,7 +1322,7 @@ class SmartHeating(hass.Hass):
 
         if self.setup_time is not None and start_time < self.setup_time:
             self.log('Start time earlier than setup time, aborting',
-                     level='WARNING')
+                     level='DEBUG')
             return
 
         end_time = start_time + dt.timedelta(seconds=duration)
@@ -1331,7 +1331,7 @@ class SmartHeating(hass.Hass):
             start_time, end_time, time_interval=time_interval, **kwargs)
 
         if recorder is None:
-            self.log('Not enough data, aborting', level='WARNING')
+            self.log('Not enough data, aborting', level='DEBUG')
             return
 
         n_times = int(np.ceil(duration / time_interval)) + 1
@@ -1344,7 +1344,7 @@ class SmartHeating(hass.Hass):
             start_time)
 
         if result is None:
-            self.log('Not enough data, aborting', level='WARNING')
+            self.log('Not enough data, aborting', level='DEBUG')
             return
 
         temperature_forecast, temperature_forecast_end_time = result
@@ -1438,7 +1438,7 @@ class SmartHeating(hass.Hass):
         self.log('Creating recorder with historical data', level='DEBUG')
 
         if end_time < start_time + dt.timedelta(hours=min_required_hours):
-            self.log('Too short duration for historical data', level='WARNING')
+            self.log('Too short duration for historical data', level='DEBUG')
             return None
 
         start_timestamp = datetime_to_timestamp(start_time)
@@ -1458,7 +1458,7 @@ class SmartHeating(hass.Hass):
             start_time=start_time, end_time=end_time)
 
         if temperature_func is None or outside_temperature_func is None or power_consumption_func is None:
-            self.log('Too short duration for historical data', level='WARNING')
+            self.log('Too short duration for historical data', level='DEBUG')
             return None
 
         recorder = TemperatureRecorder()
@@ -1496,7 +1496,7 @@ class SmartHeating(hass.Hass):
                 and datetime_to_timestamp(forecast_end_time) < times[-1]):
             if allow_thermometer_fallback:
                 self.log('Using temperatures from previous day as forecast',
-                         level='WARNING')
+                         level='DEBUG')
                 start_time = self.timestamp_to_local_datetime(times[0])
                 previous_day_start_time = start_time - dt.timedelta(days=1)
                 previous_day_times = times - dt.timedelta(
@@ -1553,7 +1553,7 @@ class SmartHeating(hass.Hass):
             if allow_forecast_fallback:
                 self.log(
                     'No outside thermometer, using forecasted temperatures as outside temperatures',
-                    level='WARNING')
+                    level='DEBUG')
                 return self._create_current_forecasted_temperature_representation(
                     **kwargs)
             else:
@@ -1568,7 +1568,7 @@ class SmartHeating(hass.Hass):
         if self.power_consumption_meter is None:
             self.log(
                 'No power consumption meter, using constant heating power',
-                level='INFO')
+                level='DEBUG')
             if self.heating_power is None:
                 self._terminate_with_error('No heating power specified')
             times, values = self._fetch_historical_state(
@@ -1704,7 +1704,7 @@ class SmartHeating(hass.Hass):
         times = []
         values = []
 
-        if len(history) > 0:
+        if history is not None and len(history) > 0:
             history = history[0]
 
             for entry in history:
